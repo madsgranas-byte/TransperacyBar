@@ -40,6 +40,12 @@ Settings are saved in `%APPDATA%\TransperacyBar\settings.ini`. Choosing *Exit* r
 
 The effect is applied to the taskbar windows (`Shell_TrayWnd`, `Shell_SecondaryTrayWnd`) with the undocumented `SetWindowCompositionAttribute` accent policy. Explorer resets the effect often, so the app re-applies it every 50 ms.
 
-From Windows 11 22H2, the taskbar is drawn with XAML, and a rectangle named `BackgroundFill` paints a solid background on top of that effect. As TranslucentTB does, TransperacyBar loads `ExplorerHook.dll` into `explorer.exe` with the XAML diagnostics API (`InitializeXamlDiagnosticsEx`). The hook finds that rectangle and the `BackgroundStroke` border line, and sets their opacity to 0. The tray app controls the hook through a hidden message window, so choosing *Normal* or *Exit* brings the standard background back.
+From Windows 11 22H2, the taskbar is drawn with XAML, and a rectangle named `BackgroundFill` paints a solid background on top of that effect. Blur and acrylic accents also turn solid black there. So, as TranslucentTB does, TransperacyBar loads `ExplorerHook.dll` into `explorer.exe` with the XAML diagnostics API (`InitializeXamlDiagnosticsEx`). The hook finds that rectangle and the `BackgroundStroke` border line, and draws the chosen look in XAML:
 
-The hook is loaded again automatically if explorer restarts. It hides the background on all monitors at once, so with *Normal when a window is maximized* and several monitors, it only returns when every taskbar is set to normal.
+- **Clear**: hides the rectangle
+- **Tinted**: fills it with a solid color brush
+- **Blur** / **Acrylic**: fills it with an `AcrylicBrush` whose source is `Backdrop`. The taskbar window itself is set to clear, so the brush blurs the desktop and windows behind it. (Explorer's own brush uses `HostBackdrop`, which gives no blur here.)
+
+The tray app controls the hook through a hidden message window, so choosing *Normal* or *Exit* brings back explorer's own brush.
+
+The hook is loaded again automatically if explorer restarts. It styles every monitor's taskbar the same way, so with *Normal when a window is maximized* and several monitors, the normal look only returns when every taskbar is set to normal.

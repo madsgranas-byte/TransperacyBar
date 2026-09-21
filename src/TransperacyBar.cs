@@ -195,21 +195,42 @@ namespace TransperacyBar
         {
             get { return ((uint)Opacity << 24) | ((uint)Color.B << 16) | ((uint)Color.G << 8) | Color.R; }
         }
+
+        // AARRGGBB, as expected by ExplorerHook.dll.
+        public uint Argb
+        {
+            get { return ((uint)Opacity << 24) | ((uint)Color.R << 16) | ((uint)Color.G << 8) | Color.B; }
+        }
     }
 
     // On Windows 11 22H2+ the taskbar's XAML draws a solid background over the window the
-    // accent is applied to. ExplorerHook.dll (see hook/) is loaded into explorer to hide it.
+    // accent is applied to, and blur/acrylic accents come out black. ExplorerHook.dll (see hook/)
+    // is loaded into explorer and draws the chosen appearance in the taskbar's XAML instead.
     static class ExplorerHook
     {
         const string WindowClass = "TransperacyBarHook";
-        const uint WM_APP_SETTRANSPARENT = 0x8000 + 1;
+        const uint WM_APP_SETAPPEARANCE = 0x8000 + 1;
         static readonly Guid Clsid = new Guid("7C8D2E61-4B3A-4F5E-9A21-6E0B5C3D8F14"); // must match ExplorerHook.cpp
 
         static uint injectedPid;     // explorer process the hook was successfully loaded into
         static int injecting;        // 1 while an injection attempt is running
         static int lastAttempt = Environment.TickCount - 10000;
         static IntPtr lastWindow = IntPtr.Zero;
-        static bool lastTransparent;
+        static int lastMode = -1;
+        static uint lastColor;
+
+        // wParam values understood by the hook; must match Mode in ExplorerHook.cpp.
+        static int HookMode(Mode mode)
+        {
+            switch (mode)
+            {
+                case Mode.Clear: return 1;
+                case Mode.Tinted: return 2;
+                case Mode.Blur: return 3;
+                case Mode.Acrylic: return 4;
+                default: return 0;
+            }
+        }
 
         static string DllPath
         {
@@ -250,12 +271,13 @@ namespace TransperacyBar
             return IntPtr.Zero;
         }
 
-        // Called on every timer tick. Injects the hook once per explorer process and keeps it
-        // in sync with whether the XAML background should be hidden.
-        public static void Update(IntPtr mainTaskbar, bool transparent)
+        // Called on every timer tick. Injects the hook once per explorer process and keeps it in
+        // sync with the chosen appearance (color is 0xAARRGGBB). Returns whether the hook is
+        // drawing the taskbar.
+        public static bool Update(IntPtr mainTaskbar, Mode mode, uint color)
         {
             if (!XamlTaskbar || mainTaskbar == IntPtr.Zero)
-                return;
+                return false;
 
             uint pid;
             Native.GetWindowThreadProcessId(mainTaskbar, out pid);
@@ -265,7 +287,7 @@ namespace TransperacyBar
             {
                 // Right after explorer starts, its XAML isn't up yet and injection fails, so retry
                 // every couple of seconds until it succeeds.
-                if (transparent && pid != injectedPid && Environment.TickCount - lastAttempt > 2000 &&
+                if (mode != Mode.Normal && pid != injectedPid && Environment.TickCount - lastAttempt > 2000 &&
                     Interlocked.CompareExchange(ref injecting, 1, 0) == 0)
                 {
                     lastAttempt = Environment.TickCount;
@@ -277,19 +299,21 @@ namespace TransperacyBar
                         injecting = 0;
                     });
                 }
-                return;
+                return false;
             }
 
-            if (hookWindow != lastWindow || transparent != lastTransparent)
+            int hookMode = HookMode(mode);
+            if (hookWindow != lastWindow || hookMode != lastMode || color != lastColor)
             {
                 IntPtr result;
-                if (Native.SendMessageTimeout(hookWindow, WM_APP_SETTRANSPARENT, new IntPtr(transparent ? 1 : 0),
-                        IntPtr.Zero, Native.SMTO_ABORTIFHUNG, 1000, out result) != IntPtr.Zero)
-                {
-                    lastWindow = hookWindow;
-                    lastTransparent = transparent;
-                }
+                if (Native.SendMessageTimeout(hookWindow, WM_APP_SETAPPEARANCE, new IntPtr(hookMode),
+                        new IntPtr(unchecked((int)color)), Native.SMTO_ABORTIFHUNG, 1000, out result) == IntPtr.Zero)
+                    return false;
+                lastWindow = hookWindow;
+                lastMode = hookMode;
+                lastColor = color;
             }
+            return true;
         }
 
         static bool Inject(uint pid, string dll)
@@ -320,7 +344,7 @@ namespace TransperacyBar
             if (hookWindow == IntPtr.Zero)
                 return;
             IntPtr result;
-            Native.SendMessageTimeout(hookWindow, WM_APP_SETTRANSPARENT, IntPtr.Zero, IntPtr.Zero,
+            Native.SendMessageTimeout(hookWindow, WM_APP_SETAPPEARANCE, IntPtr.Zero, IntPtr.Zero,
                 Native.SMTO_ABORTIFHUNG, 1000, out result);
         }
     }
@@ -465,13 +489,20 @@ namespace TransperacyBar
                 modes.Add(mode);
             }
 
-            // The hook hides the XAML background on every taskbar at once, so it stays hidden
-            // as long as any taskbar wants an effect.
+            // The hook styles every taskbar at once, so it keeps the effect as long as any
+            // taskbar wants one.
             bool anyEffect = modes.Exists(delegate(Mode m) { return m != Mode.Normal; });
-            ExplorerHook.Update(taskbars.Count > 0 ? taskbars[0] : IntPtr.Zero, anyEffect);
+            bool hooked = ExplorerHook.Update(taskbars.Count > 0 ? taskbars[0] : IntPtr.Zero,
+                anyEffect ? settings.Mode : Mode.Normal, settings.Argb);
 
             for (int i = 0; i < taskbars.Count; i++)
-                ApplyMode(taskbars[i], modes[i]);
+            {
+                // When the hook draws the effect in XAML, the window underneath just has to be see-through.
+                if (hooked)
+                    ApplyMode(taskbars[i], modes[i] == Mode.Normal ? Mode.Normal : Mode.Clear);
+                else
+                    ApplyMode(taskbars[i], modes[i]);
+            }
         }
 
         void ApplyMode(IntPtr taskbar, Mode mode)

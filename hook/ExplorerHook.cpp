@@ -1,15 +1,15 @@
 // ExplorerHook - loaded into explorer.exe through the XAML diagnostics API
 // (InitializeXamlDiagnosticsEx, called by TransperacyBar.exe).
 //
-// On Windows 11 22H2 and later the taskbar is drawn with XAML, and a rectangle named
-// "BackgroundFill" paints a solid background over the taskbar window. This DLL watches
-// the XAML visual tree, finds that rectangle (and the "BackgroundStroke" border line)
-// inside Taskbar.TaskbarBackground, and makes them invisible so the accent effect that
-// TransperacyBar.exe applies to the taskbar window shows through.
+// On Windows 11 22H2 and later the taskbar is drawn with XAML: a rectangle named
+// "BackgroundFill" paints its background and "BackgroundStroke" the border line on top.
+// Blur/acrylic accents applied to the taskbar window from outside show up as solid black
+// there, so this DLL does the whole appearance in XAML instead: it watches the visual tree,
+// finds those rectangles inside Taskbar.TaskbarBackground, and replaces or hides their brush.
 //
 // TransperacyBar.exe controls it through a message-only window of class
-// "TransperacyBarHook": send WM_APP_SETTRANSPARENT with wParam 1 to hide the XAML
-// background or 0 to show it again.
+// "TransperacyBarHook": send WM_APP_SETAPPEARANCE with the mode (see Mode) in wParam and
+// the tint color as 0xAARRGGBB in lParam.
 
 #include <windows.h>
 #include <ocidl.h>
@@ -18,8 +18,11 @@
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.UI.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Shapes.h>
 
 #include <mutex>
 #include <string>
@@ -28,11 +31,22 @@
 
 namespace
 {
+    namespace wux = winrt::Windows::UI::Xaml;
+
     // {7C8D2E61-4B3A-4F5E-9A21-6E0B5C3D8F14} - must match TransperacyBar.cs
     constexpr CLSID CLSID_Hook = { 0x7c8d2e61, 0x4b3a, 0x4f5e, { 0x9a, 0x21, 0x6e, 0x0b, 0x5c, 0x3d, 0x8f, 0x14 } };
 
     constexpr wchar_t WindowClass[] = L"TransperacyBarHook";
-    constexpr UINT WM_APP_SETTRANSPARENT = WM_APP + 1;
+    constexpr UINT WM_APP_SETAPPEARANCE = WM_APP + 1;
+
+    // Values of wParam; must match TransperacyBar.cs.
+    enum class Mode : int { Normal = 0, Clear = 1, Tinted = 2, Blur = 3, Acrylic = 4 };
+
+    struct Appearance
+    {
+        Mode mode;
+        winrt::Windows::UI::Color color;
+    };
 
     struct ElementInfo
     {
@@ -42,36 +56,89 @@ namespace
 
     struct Target
     {
-        winrt::Windows::UI::Xaml::UIElement element{ nullptr };
+        wux::Shapes::Shape shape{ nullptr };
+        wux::Media::Brush original{ nullptr }; // explorer's own brush, put back for Normal
+        bool isFill;                           // BackgroundFill, as opposed to BackgroundStroke
         DWORD threadId;
     };
 
     std::mutex g_lock;
     std::unordered_map<InstanceHandle, ElementInfo> g_elements; // every XAML element we've seen, for walking up to ancestors
     std::unordered_map<InstanceHandle, Target> g_targets;       // the taskbar background rectangles
-    bool g_transparent = true;
+    Appearance g_appearance{ Mode::Clear, { 0, 0, 0, 0 } };
     HWND g_window = nullptr;
     HMODULE g_module = nullptr;
+    thread_local bool t_applying = false; // set while we change a Fill ourselves
 
-    void ApplyTo(const Target& target, bool transparent)
+    wux::Media::Brush MakeBrush(const Appearance& appearance, const wux::Media::Brush& original)
     {
-        const double opacity = transparent ? 0.0 : 1.0;
+        switch (appearance.mode)
+        {
+        case Mode::Tinted:
+            return wux::Media::SolidColorBrush(appearance.color);
+        case Mode::Blur:
+        case Mode::Acrylic:
+        {
+            // Backdrop (not HostBackdrop, which explorer's own brush uses) samples what's behind the
+            // XAML. The taskbar window is see-through, so that's the desktop and windows behind it,
+            // and unlike HostBackdrop it keeps working while the taskbar isn't the active window.
+            wux::Media::AcrylicBrush brush;
+            brush.BackgroundSource(wux::Media::AcrylicBackgroundSource::Backdrop);
+            auto tint = appearance.color;
+            tint.A = 255;
+            brush.TintColor(tint);
+            brush.TintOpacity(appearance.color.A / 255.0);
+            // Without a luminosity layer it's a plain blur; the default gives the frosted acrylic look.
+            if (appearance.mode == Mode::Blur)
+                brush.TintLuminosityOpacity(winrt::Windows::Foundation::IReference<double>(0.0));
+            brush.FallbackColor(appearance.color);
+            return brush;
+        }
+        default:
+            return original;
+        }
+    }
+
+    // Must run on the target's UI thread.
+    void ApplyNow(const Target& target, const Appearance& appearance)
+    {
+        t_applying = true;
         try
         {
-            if (target.threadId == GetCurrentThreadId())
+            if (!target.isFill)
             {
-                target.element.Opacity(opacity);
+                target.shape.Opacity(appearance.mode == Mode::Normal ? 1.0 : 0.0);
             }
             else
             {
-                auto element = target.element;
-                target.element.Dispatcher().RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-                    [element, opacity] { element.Opacity(opacity); });
+                target.shape.Fill(MakeBrush(appearance, target.original));
+                target.shape.Opacity(appearance.mode == Mode::Clear ? 0.0 : 1.0);
             }
         }
         catch (...)
         {
             // The element may be going away; never let an exception escape into explorer.
+        }
+        t_applying = false;
+    }
+
+    void ApplyTo(const Target& target, const Appearance& appearance)
+    {
+        try
+        {
+            if (target.threadId == GetCurrentThreadId())
+            {
+                ApplyNow(target, appearance);
+            }
+            else
+            {
+                Target copy = target;
+                target.shape.Dispatcher().RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                    [copy, appearance] { ApplyNow(copy, appearance); });
+            }
+        }
+        catch (...)
+        {
         }
     }
 
@@ -79,16 +146,19 @@ namespace
     {
         std::lock_guard<std::mutex> guard(g_lock);
         for (auto& pair : g_targets)
-            ApplyTo(pair.second, g_transparent);
+            ApplyTo(pair.second, g_appearance);
     }
 
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
-        if (msg == WM_APP_SETTRANSPARENT)
+        if (msg == WM_APP_SETAPPEARANCE)
         {
             {
                 std::lock_guard<std::mutex> guard(g_lock);
-                g_transparent = wParam != 0;
+                const auto argb = static_cast<uint32_t>(lParam);
+                g_appearance.mode = static_cast<Mode>(wParam);
+                g_appearance.color = { static_cast<uint8_t>(argb >> 24), static_cast<uint8_t>(argb >> 16),
+                                       static_cast<uint8_t>(argb >> 8), static_cast<uint8_t>(argb) };
             }
             ApplyAll();
             return 1;
@@ -166,14 +236,36 @@ namespace
             winrt::com_ptr<::IInspectable> inspectable;
             if (FAILED(m_diagnostics->GetIInspectableFromHandle(element.Handle, inspectable.put())))
                 return;
-            auto uiElement = inspectable.try_as<winrt::Windows::UI::Xaml::UIElement>();
-            if (!uiElement)
+            auto shape = inspectable.try_as<wux::Shapes::Shape>();
+            if (!shape)
                 return;
 
-            Target target{ uiElement, GetCurrentThreadId() };
+            const bool isFill = name == L"BackgroundFill";
+            Target target{ shape, shape.Fill(), isFill, GetCurrentThreadId() };
+
             g_targets[element.Handle] = target;
             EnsureWindow();
-            ApplyTo(target, g_transparent);
+
+            if (isFill)
+            {
+                // Explorer swaps the brush on theme changes; remember its new one and put ours back.
+                const InstanceHandle handle = element.Handle;
+                shape.RegisterPropertyChangedCallback(wux::Shapes::Shape::FillProperty(),
+                    [handle](const wux::DependencyObject&, const wux::DependencyProperty&)
+                    {
+                        if (t_applying)
+                            return;
+                        std::lock_guard<std::mutex> guard(g_lock);
+                        auto it = g_targets.find(handle);
+                        if (it == g_targets.end())
+                            return;
+                        it->second.original = it->second.shape.Fill();
+                        if (g_appearance.mode != Mode::Normal && g_appearance.mode != Mode::Clear)
+                            ApplyNow(it->second, g_appearance);
+                    });
+            }
+
+            ApplyTo(target, g_appearance);
         }
 
         void OnRemove(InstanceHandle handle)
