@@ -1,0 +1,4 @@
+LIBRARY ExplorerHook
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

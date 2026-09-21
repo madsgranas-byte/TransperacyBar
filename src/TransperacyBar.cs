@@ -83,6 +83,20 @@ namespace TransperacyBar
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetClassName(IntPtr hwnd, StringBuilder name, int maxCount);
 
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam,
+            uint flags, uint timeout, out IntPtr result);
+
+        public static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
+        public const uint SMTO_ABORTIFHUNG = 2;
+
+        [DllImport("Windows.UI.Xaml.dll", CharSet = CharSet.Unicode)]
+        public static extern int InitializeXamlDiagnosticsEx(string endPointName, uint pid, string xamlDiagnosticsDll,
+            string tapDll, Guid tapClsid, string initializationData);
+
         public static void SetAccent(IntPtr hwnd, AccentState state, uint color)
         {
             var accent = new AccentPolicy
@@ -180,6 +194,123 @@ namespace TransperacyBar
         public uint AccentColor
         {
             get { return ((uint)Opacity << 24) | ((uint)Color.B << 16) | ((uint)Color.G << 8) | Color.R; }
+        }
+    }
+
+    // On Windows 11 22H2+ the taskbar's XAML draws a solid background over the window the
+    // accent is applied to. ExplorerHook.dll (see hook/) is loaded into explorer to hide it.
+    static class ExplorerHook
+    {
+        const string WindowClass = "TransperacyBarHook";
+        const uint WM_APP_SETTRANSPARENT = 0x8000 + 1;
+        static readonly Guid Clsid = new Guid("7C8D2E61-4B3A-4F5E-9A21-6E0B5C3D8F14"); // must match ExplorerHook.cpp
+
+        static uint injectedPid;
+        static IntPtr lastWindow = IntPtr.Zero;
+        static bool lastTransparent;
+
+        static string DllPath
+        {
+            get { return Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "ExplorerHook.dll"); }
+        }
+
+        // Environment.OSVersion reports Windows 8 to apps without a manifest, so read the real build.
+        static readonly int WindowsBuild = ReadWindowsBuild();
+
+        static int ReadWindowsBuild()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion"))
+                    return int.Parse((string)key.GetValue("CurrentBuildNumber"));
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        static bool XamlTaskbar
+        {
+            get { return WindowsBuild >= 22621 && File.Exists(DllPath); }
+        }
+
+        static IntPtr FindHookWindow(uint explorerPid)
+        {
+            IntPtr hwnd = IntPtr.Zero;
+            while ((hwnd = Native.FindWindowEx(Native.HWND_MESSAGE, hwnd, WindowClass, null)) != IntPtr.Zero)
+            {
+                uint pid;
+                Native.GetWindowThreadProcessId(hwnd, out pid);
+                if (pid == explorerPid)
+                    return hwnd;
+            }
+            return IntPtr.Zero;
+        }
+
+        // Called on every timer tick. Injects the hook once per explorer process and keeps it
+        // in sync with whether the XAML background should be hidden.
+        public static void Update(IntPtr mainTaskbar, bool transparent)
+        {
+            if (!XamlTaskbar || mainTaskbar == IntPtr.Zero)
+                return;
+
+            uint pid;
+            Native.GetWindowThreadProcessId(mainTaskbar, out pid);
+            IntPtr hookWindow = FindHookWindow(pid);
+
+            if (hookWindow == IntPtr.Zero)
+            {
+                if (transparent && pid != injectedPid)
+                {
+                    injectedPid = pid;
+                    string dll = DllPath;
+                    ThreadPool.QueueUserWorkItem(delegate { Inject(pid, dll); });
+                }
+                return;
+            }
+
+            if (hookWindow != lastWindow || transparent != lastTransparent)
+            {
+                IntPtr result;
+                if (Native.SendMessageTimeout(hookWindow, WM_APP_SETTRANSPARENT, new IntPtr(transparent ? 1 : 0),
+                        IntPtr.Zero, Native.SMTO_ABORTIFHUNG, 1000, out result) != IntPtr.Zero)
+                {
+                    lastWindow = hookWindow;
+                    lastTransparent = transparent;
+                }
+            }
+        }
+
+        static void Inject(uint pid, string dll)
+        {
+            // Each diagnostics connection name can only be used once per process.
+            for (int i = 1; i <= 10; i++)
+            {
+                try
+                {
+                    if (Native.InitializeXamlDiagnosticsEx("VisualDiagConnection" + i, pid, null, dll, Clsid, null) >= 0)
+                        return;
+                }
+                catch
+                {
+                    return;
+                }
+            }
+        }
+
+        public static void Restore(IntPtr mainTaskbar)
+        {
+            if (!XamlTaskbar || mainTaskbar == IntPtr.Zero)
+                return;
+            uint pid;
+            Native.GetWindowThreadProcessId(mainTaskbar, out pid);
+            IntPtr hookWindow = FindHookWindow(pid);
+            if (hookWindow == IntPtr.Zero)
+                return;
+            IntPtr result;
+            Native.SendMessageTimeout(hookWindow, WM_APP_SETTRANSPARENT, IntPtr.Zero, IntPtr.Zero,
+                Native.SMTO_ABORTIFHUNG, 1000, out result);
         }
     }
 
@@ -312,14 +443,24 @@ namespace TransperacyBar
         {
             HashSet<IntPtr> maximizedMonitors = settings.NormalWhenMaximized ? FindMaximizedMonitors() : null;
 
-            foreach (IntPtr taskbar in FindTaskbars())
+            List<IntPtr> taskbars = FindTaskbars();
+            var modes = new List<Mode>();
+            foreach (IntPtr taskbar in taskbars)
             {
                 Mode mode = settings.Mode;
                 if (maximizedMonitors != null &&
                     maximizedMonitors.Contains(Native.MonitorFromWindow(taskbar, Native.MONITOR_DEFAULTTONEAREST)))
                     mode = Mode.Normal;
-                ApplyMode(taskbar, mode);
+                modes.Add(mode);
             }
+
+            // The hook hides the XAML background on every taskbar at once, so it stays hidden
+            // as long as any taskbar wants an effect.
+            bool anyEffect = modes.Exists(delegate(Mode m) { return m != Mode.Normal; });
+            ExplorerHook.Update(taskbars.Count > 0 ? taskbars[0] : IntPtr.Zero, anyEffect);
+
+            for (int i = 0; i < taskbars.Count; i++)
+                ApplyMode(taskbars[i], modes[i]);
         }
 
         void ApplyMode(IntPtr taskbar, Mode mode)
@@ -417,8 +558,10 @@ namespace TransperacyBar
         void Exit()
         {
             timer.Stop();
-            foreach (IntPtr taskbar in FindTaskbars())
+            List<IntPtr> taskbars = FindTaskbars();
+            foreach (IntPtr taskbar in taskbars)
                 Native.SetAccent(taskbar, Native.AccentState.Disabled, 0);
+            ExplorerHook.Restore(taskbars.Count > 0 ? taskbars[0] : IntPtr.Zero);
             trayIcon.Visible = false;
             trayIcon.Dispose();
             ExitThread();

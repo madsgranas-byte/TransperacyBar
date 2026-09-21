@@ -6,7 +6,12 @@ this projet will create a transparent desktop bar at the bottom, instead of that
 
 ## Build
 
-Run `build.bat`. It uses the C# compiler that ships with Windows (.NET Framework 4), so nothing else needs to be installed. The result is `bin\TransperacyBar.exe`.
+Run `build.bat`. It produces:
+
+- `bin\TransperacyBar.exe`, the tray app. It's built with the C# compiler that ships with Windows (.NET Framework 4), so it needs nothing extra.
+- `bin\ExplorerHook.dll`, needed on Windows 11 22H2 and later. It's built with the Visual Studio C++ tools (`winget install Microsoft.VisualStudio.2022.BuildTools` with the "Desktop development with C++" workload). If those tools aren't installed, this step is skipped.
+
+Once the hook has been loaded, explorer keeps `ExplorerHook.dll` locked. To rebuild it, restart explorer first.
 
 ## Use
 
@@ -21,6 +26,10 @@ Start `bin\TransperacyBar.exe`. It sits in the system tray; right-click the icon
 
 Settings are saved in `%APPDATA%\TransperacyBar\settings.ini`. Choosing *Exit* restores the normal taskbar.
 
-## Limitation on Windows 11 22H2 and later
+## How it works
 
-The effect is applied with `SetWindowCompositionAttribute`, which works on Windows 10 and early Windows 11. From Windows 11 22H2, the taskbar is drawn with XAML, and that layer paints a solid background on top of the effect, so no change is visible. TranslucentTB gets around this by injecting a helper DLL into `explorer.exe` to hide that background; TransperacyBar does not do this yet.
+The effect is applied to the taskbar windows (`Shell_TrayWnd`, `Shell_SecondaryTrayWnd`) with the undocumented `SetWindowCompositionAttribute` accent policy. Explorer resets the effect often, so the app re-applies it every 50 ms.
+
+From Windows 11 22H2, the taskbar is drawn with XAML, and a rectangle named `BackgroundFill` paints a solid background on top of that effect. As TranslucentTB does, TransperacyBar loads `ExplorerHook.dll` into `explorer.exe` with the XAML diagnostics API (`InitializeXamlDiagnosticsEx`). The hook finds that rectangle and the `BackgroundStroke` border line, and sets their opacity to 0. The tray app controls the hook through a hidden message window, so choosing *Normal* or *Exit* brings the standard background back.
+
+The hook is loaded again automatically if explorer restarts. It hides the background on all monitors at once, so with *Normal when a window is maximized* and several monitors, it only returns when every taskbar is set to normal.
