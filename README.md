@@ -13,6 +13,16 @@ Run `build.bat`. It produces:
 
 Once the hook has been loaded, explorer keeps `ExplorerHook.dll` locked. To rebuild it, restart explorer first.
 
+## Install (start when you log in)
+
+After building, run `install.bat`. It:
+
+- copies the program to `%LOCALAPPDATA%\Programs\TransperacyBar`
+- adds it to your startup apps (you can turn it off under Settings > Apps > Startup, or with *Start with Windows* in the tray menu)
+- starts it
+
+To install a newer build, run `install.bat` again. If explorer is using the old `ExplorerHook.dll`, restart explorer first. To remove the program, run `uninstall.bat`.
+
 ## Use
 
 Start `bin\TransperacyBar.exe`. It sits in the system tray; right-click the icon to choose:

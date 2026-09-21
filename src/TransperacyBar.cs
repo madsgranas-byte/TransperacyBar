@@ -205,7 +205,9 @@ namespace TransperacyBar
         const uint WM_APP_SETTRANSPARENT = 0x8000 + 1;
         static readonly Guid Clsid = new Guid("7C8D2E61-4B3A-4F5E-9A21-6E0B5C3D8F14"); // must match ExplorerHook.cpp
 
-        static uint injectedPid;
+        static uint injectedPid;     // explorer process the hook was successfully loaded into
+        static int injecting;        // 1 while an injection attempt is running
+        static int lastAttempt = Environment.TickCount - 10000;
         static IntPtr lastWindow = IntPtr.Zero;
         static bool lastTransparent;
 
@@ -261,11 +263,19 @@ namespace TransperacyBar
 
             if (hookWindow == IntPtr.Zero)
             {
-                if (transparent && pid != injectedPid)
+                // Right after explorer starts, its XAML isn't up yet and injection fails, so retry
+                // every couple of seconds until it succeeds.
+                if (transparent && pid != injectedPid && Environment.TickCount - lastAttempt > 2000 &&
+                    Interlocked.CompareExchange(ref injecting, 1, 0) == 0)
                 {
-                    injectedPid = pid;
+                    lastAttempt = Environment.TickCount;
                     string dll = DllPath;
-                    ThreadPool.QueueUserWorkItem(delegate { Inject(pid, dll); });
+                    ThreadPool.QueueUserWorkItem(delegate
+                    {
+                        if (Inject(pid, dll))
+                            injectedPid = pid;
+                        injecting = 0;
+                    });
                 }
                 return;
             }
@@ -282,7 +292,7 @@ namespace TransperacyBar
             }
         }
 
-        static void Inject(uint pid, string dll)
+        static bool Inject(uint pid, string dll)
         {
             // Each diagnostics connection name can only be used once per process.
             for (int i = 1; i <= 10; i++)
@@ -290,13 +300,14 @@ namespace TransperacyBar
                 try
                 {
                     if (Native.InitializeXamlDiagnosticsEx("VisualDiagConnection" + i, pid, null, dll, Clsid, null) >= 0)
-                        return;
+                        return true;
                 }
                 catch
                 {
-                    return;
+                    return false;
                 }
             }
+            return false;
         }
 
         public static void Restore(IntPtr mainTaskbar)
